@@ -6,6 +6,9 @@
 (define-constant ERR-BIOMETRIC-EXISTS (err u405))
 (define-constant ERR-TOKEN-NOT-FOUND (err u406))
 
+(define-constant ERR-SESSION-NOT-FOUND (err u407))
+(define-constant ERR-SESSION-EXPIRED (err u408))
+
 (define-map biometric-registry
     { user: principal }
     {
@@ -218,4 +221,126 @@
         total-tokens: (var-get token-counter),
         oracle-threshold: (var-get oracle-threshold),
     }
+)
+
+
+
+
+(define-map biometric-sessions
+    { session-id: uint }
+    {
+        user: principal,
+        expires-at: uint,
+        created-at: uint,
+        active: bool,
+        activity-count: uint,
+    }
+)
+
+(define-map session-activities
+    { session-id: uint, activity-index: uint }
+    {
+        action: (string-ascii 50),
+        timestamp: uint,
+    }
+)
+
+(define-data-var session-counter uint u0)
+(define-data-var default-session-duration uint u144)
+
+(define-read-only (get-session (session-id uint))
+    (map-get? biometric-sessions { session-id: session-id })
+)
+
+(define-read-only (is-session-valid (session-id uint))
+    (match (get-session session-id)
+        session-data (and
+            (< stacks-block-height (get expires-at session-data))
+            (get active session-data)
+        )
+        false
+    )
+)
+
+(define-public (create-biometric-session 
+        (user principal) 
+        (biometric-hash (buff 64))
+        (duration uint)
+    )
+    (let (
+            (current-session-id (+ (var-get session-counter) u1))
+            (expires-at (+ stacks-block-height 
+                (if (> duration u0) duration (var-get default-session-duration))
+            ))
+        )
+        (asserts! (is-oracle-authorized tx-sender) ERR-UNAUTHORIZED)
+        
+        (match (get-biometric-data user)
+            user-biometric (begin
+                (asserts!
+                    (is-eq (get biometric-hash user-biometric) biometric-hash)
+                    ERR-INVALID-BIOMETRIC
+                )
+                (asserts! (get active user-biometric) ERR-INVALID-BIOMETRIC)
+                
+                (map-set biometric-sessions { session-id: current-session-id } {
+                    user: user,
+                    expires-at: expires-at,
+                    created-at: stacks-block-height,
+                    active: true,
+                    activity-count: u0,
+                })
+                
+                (var-set session-counter current-session-id)
+                (ok current-session-id)
+            )
+            ERR-INVALID-BIOMETRIC
+        )
+    )
+)
+
+(define-public (execute-with-session (session-id uint) (action (string-ascii 50)))
+    (match (get-session session-id)
+        session-data (begin
+            (asserts! (is-eq tx-sender (get user session-data)) ERR-UNAUTHORIZED)
+            (asserts! (is-session-valid session-id) ERR-SESSION-EXPIRED)
+            
+            (let ((activity-index (get activity-count session-data)))
+                (map-set session-activities 
+                    { session-id: session-id, activity-index: activity-index }
+                    {
+                        action: action,
+                        timestamp: stacks-block-height,
+                    }
+                )
+                
+                (map-set biometric-sessions { session-id: session-id }
+                    (merge session-data { activity-count: (+ activity-index u1) })
+                )
+                
+                (ok "Session action executed")
+            )
+        )
+        ERR-SESSION-NOT-FOUND
+    )
+)
+
+(define-public (terminate-session (session-id uint))
+    (match (get-session session-id)
+        session-data (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (get user session-data))
+                    (is-eq tx-sender CONTRACT-OWNER)
+                )
+                ERR-UNAUTHORIZED
+            )
+            
+            (map-set biometric-sessions { session-id: session-id }
+                (merge session-data { active: false })
+            )
+            (ok true)
+        )
+        ERR-SESSION-NOT-FOUND
+    )
 )
