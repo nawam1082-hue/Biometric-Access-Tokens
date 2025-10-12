@@ -6,6 +6,11 @@
 (define-constant ERR-BIOMETRIC-EXISTS (err u405))
 (define-constant ERR-TOKEN-NOT-FOUND (err u406))
 
+(define-constant ERR-DELEGATION-NOT-FOUND (err u409))
+(define-constant ERR-DELEGATION-EXPIRED (err u410))
+(define-constant ERR-DELEGATION-CHAIN-LIMIT (err u411))
+(define-constant ERR-SELF-DELEGATION (err u412))
+
 (define-constant ERR-SESSION-NOT-FOUND (err u407))
 (define-constant ERR-SESSION-EXPIRED (err u408))
 
@@ -342,5 +347,85 @@
             (ok true)
         )
         ERR-SESSION-NOT-FOUND
+    )
+)
+
+(define-map delegation-registry
+    { delegation-id: uint }
+    {
+        delegator: principal,
+        delegate: principal,
+        expires-at: uint,
+        created-at: uint,
+        revoked: bool,
+        max-depth: uint,
+    }
+)
+
+(define-data-var delegation-counter uint u0)
+
+(define-read-only (get-delegation (delegation-id uint))
+    (map-get? delegation-registry { delegation-id: delegation-id })
+)
+
+(define-read-only (is-delegation-valid (delegation-id uint))
+    (match (get-delegation delegation-id)
+        delegation-data (and
+            (< stacks-block-height (get expires-at delegation-data))
+            (not (get revoked delegation-data))
+        )
+        false
+    )
+)
+
+(define-public (create-delegation 
+        (delegate principal)
+        (duration uint)
+        (max-depth uint)
+    )
+    (let (
+            (current-delegation-id (+ (var-get delegation-counter) u1))
+            (expires-at (+ stacks-block-height duration))
+        )
+        (asserts! (not (is-eq tx-sender delegate)) ERR-SELF-DELEGATION)
+        (asserts! (<= max-depth u3) ERR-DELEGATION-CHAIN-LIMIT)
+        
+        (match (get-biometric-data tx-sender)
+            user-biometric (begin
+                (asserts! (get active user-biometric) ERR-INVALID-BIOMETRIC)
+                
+                (map-set delegation-registry { delegation-id: current-delegation-id } {
+                    delegator: tx-sender,
+                    delegate: delegate,
+                    expires-at: expires-at,
+                    created-at: stacks-block-height,
+                    revoked: false,
+                    max-depth: max-depth,
+                })
+                
+                (var-set delegation-counter current-delegation-id)
+                (ok current-delegation-id)
+            )
+            ERR-INVALID-BIOMETRIC
+        )
+    )
+)
+
+(define-public (revoke-delegation (delegation-id uint))
+    (match (get-delegation delegation-id)
+        delegation-data (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (get delegator delegation-data))
+                    (is-eq tx-sender CONTRACT-OWNER)
+                )
+                ERR-UNAUTHORIZED
+            )
+            (map-set delegation-registry { delegation-id: delegation-id }
+                (merge delegation-data { revoked: true })
+            )
+            (ok true)
+        )
+        ERR-DELEGATION-NOT-FOUND
     )
 )
