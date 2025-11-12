@@ -14,6 +14,10 @@
 (define-constant ERR-SESSION-NOT-FOUND (err u407))
 (define-constant ERR-SESSION-EXPIRED (err u408))
 
+(define-constant ERR-CHECKPOINT-REQUIRED (err u413))
+(define-constant ERR-CHECKPOINT-EXPIRED (err u414))
+(define-constant ERR-CHECKPOINT-NOT-FOUND (err u415))
+
 (define-map biometric-registry
     { user: principal }
     {
@@ -427,5 +431,124 @@
             (ok true)
         )
         ERR-DELEGATION-NOT-FOUND
+    )
+)
+
+
+(define-map security-checkpoints
+    { checkpoint-id: uint }
+    {
+        user: principal,
+        biometric-hash: (buff 64),
+        created-at: uint,
+        expires-at: uint,
+        verified: bool,
+        operation-type: (string-ascii 30),
+    }
+)
+
+(define-map user-checkpoint-history
+    { user: principal, checkpoint-index: uint }
+    {
+        checkpoint-id: uint,
+        timestamp: uint,
+    }
+)
+
+(define-map user-checkpoint-count
+    { user: principal }
+    { count: uint }
+)
+
+(define-data-var checkpoint-counter uint u0)
+(define-data-var checkpoint-validity-duration uint u10)
+
+(define-read-only (get-checkpoint (checkpoint-id uint))
+    (map-get? security-checkpoints { checkpoint-id: checkpoint-id })
+)
+
+(define-read-only (is-checkpoint-verified (checkpoint-id uint))
+    (match (get-checkpoint checkpoint-id)
+        checkpoint-data (and
+            (get verified checkpoint-data)
+            (< stacks-block-height (get expires-at checkpoint-data))
+        )
+        false
+    )
+)
+
+(define-public (create-checkpoint (operation-type (string-ascii 30)))
+    (let (
+            (current-checkpoint-id (+ (var-get checkpoint-counter) u1))
+            (expires-at (+ stacks-block-height (var-get checkpoint-validity-duration)))
+            (user-count (default-to { count: u0 } 
+                (map-get? user-checkpoint-count { user: tx-sender })))
+        )
+        (match (get-biometric-data tx-sender)
+            user-biometric (begin
+                (asserts! (get active user-biometric) ERR-INVALID-BIOMETRIC)
+                
+                (map-set security-checkpoints { checkpoint-id: current-checkpoint-id } {
+                    user: tx-sender,
+                    biometric-hash: (get biometric-hash user-biometric),
+                    created-at: stacks-block-height,
+                    expires-at: expires-at,
+                    verified: false,
+                    operation-type: operation-type,
+                })
+                
+                (map-set user-checkpoint-history 
+                    { user: tx-sender, checkpoint-index: (get count user-count) }
+                    { checkpoint-id: current-checkpoint-id, timestamp: stacks-block-height }
+                )
+                
+                (map-set user-checkpoint-count { user: tx-sender }
+                    { count: (+ (get count user-count) u1) }
+                )
+                
+                (var-set checkpoint-counter current-checkpoint-id)
+                (ok current-checkpoint-id)
+            )
+            ERR-INVALID-BIOMETRIC
+        )
+    )
+)
+
+(define-public (verify-checkpoint 
+        (checkpoint-id uint)
+        (user principal)
+        (biometric-hash (buff 64))
+    )
+    (begin
+        (asserts! (is-oracle-authorized tx-sender) ERR-UNAUTHORIZED)
+        
+        (match (get-checkpoint checkpoint-id)
+            checkpoint-data (begin
+                (asserts! (is-eq (get user checkpoint-data) user) ERR-UNAUTHORIZED)
+                (asserts! (< stacks-block-height (get expires-at checkpoint-data)) ERR-CHECKPOINT-EXPIRED)
+                (asserts! (is-eq (get biometric-hash checkpoint-data) biometric-hash) ERR-INVALID-BIOMETRIC)
+                
+                (map-set security-checkpoints { checkpoint-id: checkpoint-id }
+                    (merge checkpoint-data { verified: true })
+                )
+                (ok true)
+            )
+            ERR-CHECKPOINT-NOT-FOUND
+        )
+    )
+)
+
+(define-public (execute-with-checkpoint 
+        (checkpoint-id uint)
+        (action (string-ascii 50))
+    )
+    (match (get-checkpoint checkpoint-id)
+        checkpoint-data (begin
+            (asserts! (is-eq tx-sender (get user checkpoint-data)) ERR-UNAUTHORIZED)
+            (asserts! (is-checkpoint-verified checkpoint-id) ERR-CHECKPOINT-REQUIRED)
+            
+            (ok "Checkpoint-protected action executed")
+        )
+        ERR-CHECKPOINT-NOT-FOUND
     )
 )
